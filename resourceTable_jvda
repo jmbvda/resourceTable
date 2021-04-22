@@ -1,0 +1,388 @@
+"""
+Configure data sources in features.py and then run this script.
+"""
+
+import arcpy
+import os
+import sys
+import datetime
+import logging
+from features import muni_query, parcel_fields_tokeep, feature_areas, feature_values, \
+    plan_conformance_data, species_table, critical_habitat_data
+from utils import check_pamspin, check_val
+
+# set up logging to file
+logging.basicConfig(
+    filename='debug.log',
+    level=logging.INFO,
+    format='[%(asctime)s] {%(pathname)s:%(lineno)d} %(levelname)s - %(message)s',
+    datefmt='%H:%M:%S'
+)
+
+cwd = os.path.dirname(os.path.realpath(__file__))
+#oit_parcels_path = os.path.join('data', 'Statewide_Parcels_MODIV.gdb', 'Cad_parcel_mod4')
+oit_parcels_path = r'R:\Data_Management\Code_Library\Base_Data\Administrative\ResourceTable\ResourceTableData.gdb\script\data\HL_Parcels_2019_subset' #not really OIT parcels
+out_path = os.path.join(cwd, 'data', 'output.gdb')
+out_name = 'cad_parcel_hl'
+modiv_parcel_acr_field = 'CALC_ACRE'
+
+fc = os.path.join(out_path, out_name)
+
+arcpy.env.overwriteOutput = True
+
+# python expression to calculate percent - do not change indentation.
+pct_codeblock = """
+def get_pct(area, lot_acres):
+    if area:
+        return round(area / lot_acres * 100, 2)
+    return 0
+"""
+
+
+def check_field_exists(fc, field_name):
+    list_fields = arcpy.ListFields(fc)
+    for field in list_fields:
+        if field.name == field_name:
+            return True
+    return False
+
+
+def delete_fields(fc, fields):
+    try:
+        arcpy.DeleteField_management(fc, fields)
+        print('Deleted fields.')
+    except Exception as e:
+        print('Error deleting fields: {}.'.format(e))
+
+
+def process_feature_areas():
+    """
+    Creates 2 new fileds for each layer: Acres and Percent. These fields are calculated from an
+    intersect and dissolve of the layer with the parcels.
+    """
+
+    for f in feature_areas:
+
+        try:
+            e = False
+            print("\n*Processing {} acres/pct*".format(f['col_name']))
+            # check if fields exists, if not create it
+            # fc = os.path.join(out_path, out_name)
+            acre_field = "{}_ACR".format(f['col_name']).upper()  # uppercase for OIT
+            acre_field_exists = check_field_exists(fc, acre_field)
+            pct_field = "{}_PCT".format(f['col_name']).upper()  # uppercase for OIT
+            pct_field_exists = check_field_exists(fc, pct_field)
+            if not acre_field_exists:
+                print('Creating {} field'.format(acre_field))
+                arcpy.AddField_management(fc, acre_field, 'DOUBLE')
+            if not pct_field_exists:
+                print('Creating {} field'.format(pct_field))
+                arcpy.AddField_management(fc, pct_field, 'DOUBLE')
+
+            if not pct_field_exists or not acre_field_exists:  # do geoprocessing if fields do not exist
+
+                # Create scratch variables
+                feature = "in_memory" + "\\" + "mem_feature"
+                intersected = os.path.join(arcpy.env.scratchGDB, "scratch_intersected")
+                dissolve_out = os.path.join(arcpy.env.scratchGDB, "scratch_dissolve_out")
+                dissolved = "in_memory" + "\\" + "mem_dissolved"
+                table_view = "in_memory" + "\\" + "mem_table_view"  # Make a table view for addJoin
+
+                arcpy.MakeFeatureLayer_management(f['feature'], feature, f['def_query'])
+
+                # Do the Geoprocessing
+                print('Intersecting...')
+                arcpy.Intersect_analysis([feature, fc], intersected, "ALL")
+                print('Dissolving...')
+                arcpy.Dissolve_management(intersected, dissolve_out, ["PCL_GUID", modiv_parcel_acr_field])
+                print('Calculating Acres...')
+                arcpy.CalculateField_management(dissolve_out, modiv_parcel_acr_field, "!shape.area@acres!")
+
+                # Join the tables
+                print('adding index...')
+                arcpy.AddIndex_management(dissolve_out, "PCL_GUID", "GUIDIndex", "UNIQUE")
+                print('making feature layer...')
+                arcpy.MakeFeatureLayer_management(dissolve_out, dissolved)
+                print('making table view...')
+                arcpy.MakeTableView_management(fc, table_view)
+                print('adding join...')
+                arcpy.AddJoin_management(table_view, "PCL_GUID", dissolved, "PCL_GUID")
+
+                # Variables for field calculations
+                new_calc = "{}.{}".format(out_name, f['col_name'])
+                dis_calc = 'scratch_dissolve_out.{}'.format(modiv_parcel_acr_field)
+                lot_acres = "{}.{}".format(out_name, modiv_parcel_acr_field)
+                acr_expression = "round(!{}! or 0, 2)".format(dis_calc)
+                pct_expression = "get_pct(!{}!, !{}!)".format(dis_calc, lot_acres)
+                print('calculating new acre field...')
+                arcpy.CalculateField_management(table_view, new_calc + '_ACR', acr_expression)
+                print('calculating new pct field...')
+                arcpy.CalculateField_management(table_view, new_calc + '_PCT', pct_expression, "PYTHON3", pct_codeblock)
+
+                # Cleanup
+                print('Cleaning up...')
+                arcpy.Delete_management(dissolve_out)
+                arcpy.Delete_management(dissolved)
+                arcpy.Delete_management(feature)
+                arcpy.Delete_management(intersected)
+                arcpy.RemoveJoin_management(table_view)
+            else:
+                print('skipping data')
+                logging.info('{} skipped'.format(f['col_name']))
+
+        except Exception as ex:
+            print('Error: ', ex)
+            logging.error('\n{}: {}\n'.format(f['col_name'], ex))
+            e = True
+
+        finally:
+            arcpy.Delete_management("in_memory")
+            if e:  # delete fields if error was encountered
+                delete_fields(fc, fields=[acre_field, pct_field])
+            else:
+                logging.info('{} completed'.format(f['col_name']))
+
+
+def process_feature_values():
+    """
+    extracts a specified value from the layer that intersects with a parcel.
+    :return:
+    """
+    for f in feature_values:
+
+        try:
+            e = False
+            print("\n*Processing {} - {}*".format(f['col_name'], f['src_col_name']))
+
+            # check if fields exists, if not create it
+            # fc = os.path.join(out_path, out_name)
+            field_exists = check_field_exists(fc, f['col_name'])
+            if not field_exists:
+                print('Creating {} field'.format(f['col_name']))
+                arcpy.AddField_management(os.path.join(out_path, out_name), f['col_name'], 'TEXT', field_length=150)
+
+                # Create in_memory variables
+                feature = "in_memory" + "\\" + "mem_feature"
+                intersected = "in_memory" + "\\" + "mem_intersected"
+                dissolve_out = os.path.join(arcpy.env.scratchGDB, "scratch_dissolve_out")
+                dissolved = "in_memory" + "\\" + "mem_dissolved"
+                table_view = "in_memory" + "\\" + "mem_table_view"  # Make a table view for addJoin
+
+                arcpy.MakeFeatureLayer_management(f['feature'], feature, f['def_query'])
+
+                # Do the Geoprocessing
+                print('Intersecting...')
+                arcpy.Intersect_analysis([feature, os.path.join(out_path, out_name)], intersected, "ALL")
+                print('Dissolving...')
+                arcpy.Dissolve_management(intersected, dissolve_out, ["PCL_GUID", f['src_col_name']],
+                                          [[f['src_col_name'], 'MAX']], )
+
+                # Join the tables
+                print('Joining Table...')
+                print('adding index...')
+                arcpy.AddIndex_management(dissolve_out, "PCL_GUID", "GUIDIndex", "UNIQUE")
+                print('making feature layer...')
+                arcpy.MakeFeatureLayer_management(dissolve_out, dissolved)
+                print('making table view...')
+                arcpy.MakeTableView_management(os.path.join(out_path, out_name), table_view)
+                print('adding join...')
+                arcpy.AddJoin_management(table_view, "PCL_GUID", dissolved, "PCL_GUID")
+
+                print('calculating new field...')
+                new_calc = "{}.{}".format(out_name, f['col_name'])
+                dis_calc = 'scratch_dissolve_out.{}'.format(f['src_col_name'])
+
+                arcpy.CalculateField_management(table_view, new_calc, "!{}!".format(dis_calc))
+
+                # Cleanup
+                print('Cleaning up...')
+                arcpy.Delete_management(dissolve_out)
+                arcpy.RemoveJoin_management(table_view)
+            else:
+                print('skipping data')
+                logging.info('{} skipped'.format(f['col_name']))
+
+        except Exception as ex:
+            print('Error: ', ex)
+            logging.error('\n{}: {}\n'.format(f['col_name'], ex))
+            e = True
+
+        finally:
+            arcpy.Delete_management("in_memory")
+            if e:  # delete fields if error was encountered
+                delete_fields(fc, fields=[f['col_name']])
+            else:
+                logging.info('{} completed'.format(f['col_name']))
+
+
+
+def process_plan_conformance():
+    """ Populate the PLAN_CONFORMANCE column from the conformance approved petitions data"""
+    e = False
+    modiv_ssn = 'PCL_MUN'
+
+    # Get a list of munis
+    try:
+        field_exists = check_field_exists(fc, plan_conformance_data['col_name'])
+        if not field_exists:
+            print('Calculating plan conformance...')
+            arcpy.AddField_management(fc, plan_conformance_data['col_name'], 'TEXT', field_length=100)
+            the_munis = []
+
+            with arcpy.da.SearchCursor(plan_conformance_data['feature'], ['ssn', 'region']) as sc_pc:
+                for pc in sc_pc:
+                    filtered = list(filter(lambda x: x[0] == pc[0], the_munis))
+                    if len(filtered) and filtered[0][1].upper() != pc[1].upper():
+                        the_munis.remove(filtered[0])
+                        the_munis.append((pc[0], 'Preservation and Planning Area'))
+                    else:
+                        the_munis.append(pc)
+            the_munis_sorted = sorted(the_munis, key=lambda x: x[0], reverse=True)
+            for m in the_munis_sorted:
+                query = "where {} = '{}'".format(modiv_ssn, m[0])
+                with arcpy.da.UpdateCursor(fc, [modiv_ssn, plan_conformance_data['col_name']],
+                                           sql_clause=(None, query)) as sc_rsc:
+                    for sr in sc_rsc:
+                        sr[1] = m[1]
+                        sc_rsc.updateRow(sr)
+                print("completed {}".format(m[0]))
+    except Exception as ex:
+        print('Error: ', ex)
+        logging.error('\n{}: {}\n'.format(plan_conformance_data['col_name'], ex))
+        e = True
+    finally:
+        if e:  # delete fields if error was encountered
+            delete_fields(fc, fields=[plan_conformance_data['col_name']])
+        else:
+            logging.info('{} completed'.format(plan_conformance_data['col_name']))
+
+def process_septic():
+    """
+    These are placeholder fields for septic density analysis. Currently not being used.
+    :return:
+    """
+    septic_fields = ['LULC_FOREST_SEPTIC_PRES', 'LULC_NONFOREST_SEPTIC_PRES', 'LUCZ_CZ_SEPTIC_PLAN',
+                     'LUCZ_ECZ_SEPTIC_PLAN', 'LUCZ_PZ_SEPTIC_PLAN']
+    for s in septic_fields:
+        try:
+            arcpy.AddField_management(fc, s, 'DOUBLE')
+        except Exception as e:
+            print(e)
+            continue
+
+
+def process_species():
+    """Process the SPECIES column from critical wildlife habitat and related table"""
+    col_name = 'SPECIES'
+
+    print("\n* Processing Species Data*")
+
+    print('Calculating Species...')
+    # Create in_memory variables
+    feature = "in_memory" + "\\" + "mem_feature"
+    intersected = "in_memory" + "\\" + "mem_intersected"
+    dissolve_out = os.path.join(arcpy.env.scratchGDB, "scratch_dissolve_out")
+
+    arcpy.MakeFeatureLayer_management(critical_habitat_data, feature)
+
+    # Do the Geoprocessing
+    print('Intersecting...')
+    arcpy.Intersect_analysis([feature, os.path.join(out_path, out_name)], intersected, "ALL")
+    print('Dissolving...')
+    arcpy.Dissolve_management(intersected, dissolve_out, ["PCL_GUID", "linkid"])
+
+    try:
+        # add some indexes for faster performance
+        arcpy.AddIndex_management(dissolve_out, "PCL_GUID", "GUIDIndex")
+        arcpy.AddIndex_management(dissolve_out, "linkid", "LinkidIndex")
+    except Exception as e:
+        print(e)
+    print('writing to GDB')
+
+    q = "SPECIES = 'error'"  # lets not repeat anything thats already been populated.
+
+    row_count = len(list(i for i in arcpy.da.SearchCursor(os.path.join(out_path, out_name), ["OBJECTID"], q)))
+
+    print("Row count is {}".format(row_count))
+
+    with arcpy.da.UpdateCursor(os.path.join(out_path, out_name), ["PCL_GUID", col_name], q) as cursor:
+        # iterate through the parcel table and get each GUID.
+
+        for idx, row in enumerate(cursor):
+            try:
+                err = False
+                link_ids = []
+                species = []
+                guid = row[0]
+                query = "where PCL_GUID = '{}'".format(guid)
+                dissolve_cursor = arcpy.da.SearchCursor(dissolve_out, ['linkid'], sql_clause=(None, query))
+
+                # Get the LINK for each associated GUID
+                for dissolve_row in dissolve_cursor:
+                    link_ids.append(dissolve_row[0])
+                links_joined = ', '.join('{0}'.format(l) for l in link_ids)
+
+                if len(link_ids):
+                    species_query = "where linkid IN (" + links_joined + ")"
+                    # Look up the LINK in the species table and update the parcel table with each species.
+                    species_cursor = arcpy.da.SearchCursor(species_table, ['comname'],
+                                                           sql_clause=(None, species_query))
+                    for species_row in species_cursor:
+                        species.append(species_row[0])
+                    row[1] = ",".join(sorted(set(species)))  # remove duplicates and put in alphabetical order.
+                    cursor.updateRow(row)
+                if idx % 10000 == 0:
+                    pct = idx / row_count * 100
+                    print("{}% complete - current index is {}".format(round(pct, 2), idx))
+
+            except Exception as e:
+                print('error', e)
+                row[1] = 'error'
+                cursor.updateRow(row)
+                pass
+
+
+def create_feature_class():
+    print('creating new feature class from MODIV parcels')
+    try:
+        fms = arcpy.FieldMappings()
+        for p in parcel_fields_tokeep:
+            fm = arcpy.FieldMap()
+            fm.addInputField(oit_parcels_path, p)
+            fms.addFieldMap(fm)
+
+        arcpy.FeatureClassToFeatureClass_conversion(in_features=oit_parcels_path,
+                                                    out_path=out_path,
+                                                    out_name=out_name,
+                                                    field_mapping=fms,
+                                                    where_clause=muni_query)
+        print('Adding Index to GUID...')
+        arcpy.AddIndex_management(os.path.join(out_path, out_name), ["PCL_GUID"], "GUIDIndex", "UNIQUE", "NON_ASCENDING")
+
+        print('Recalculating geometry...')
+        arcpy.CalculateField_management(os.path.join(out_path, out_name), 'CALC_ACRE', "!Shape.Area@ACRES!", 'PYTHON')
+
+        print('Checking for null municipal and county names...')
+        check_val(os.path.join(out_path, out_name))
+
+        print('Checking for null pams pin (gis_pin)')
+        check_pamspin(os.path.join(out_path, out_name))
+
+    except Exception as e:
+        print(e)
+        #sys.exit(1)
+
+
+if __name__ == "__main__":
+    start_time = datetime.datetime.now()
+    create_feature_class()
+    process_plan_conformance()
+    process_species()
+    process_feature_values()
+    # process_septic()
+    process_feature_areas()
+
+    end_time = datetime.datetime.now()
+    time_msg = '\n' + 'Total Run Time: {}'.format(end_time - start_time)
+    print(time_msg)
+    logging.info(time_msg)
