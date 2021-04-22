@@ -1,0 +1,44 @@
+import arcpy
+import os
+import sys
+import datetime
+import logging
+from features import muni_query, parcel_fields_tokeep, feature_areas, feature_values, \
+    plan_conformance_data, species_table, critical_habitat_data
+from utils import check_pamspin, check_val
+
+cwd = os.path.dirname(os.path.realpath(__file__))
+#oit_parcels_path = os.path.join('data', 'Statewide_Parcels_MODIV.gdb', 'Cad_parcel_mod4')
+oit_parcels_path = r'R:\Data_Management\Code_Library\Base_Data\Administrative\ResourceTable\ResourceTableData.gdb\script\data\HL_Parcels_2019_subset' #not really OIT parcels
+out_path = os.path.join(cwd, 'data', 'output.gdb')
+out_name = 'cad_parcel_hl'
+modiv_parcel_acr_field = 'CALC_ACRE'
+
+fc = os.path.join(out_path, out_name)
+
+arcpy.env.overwriteOutput = True
+
+
+def create_feature_class():
+    print('creating new feature class from MODIV parcels')
+
+    fms = arcpy.FieldMappings()
+    print fms
+    for p in parcel_fields_tokeep:
+        print p
+        fm = arcpy.FieldMap()
+        print fm
+        print fms
+        fm.addInputField(oit_parcels_path, p)
+        fms.addFieldMap(fm)
+
+    arcpy.FeatureClassToFeatureClass_conversion(in_features=oit_parcels_path,
+                                                out_path=out_path,
+                                                out_name=out_name)#,
+                                                #field_mapping=fms,
+                                                #where_clause=muni_query)
+
+
+if __name__ == "__main__":
+    start_time = datetime.datetime.now()
+    create_feature_class()
